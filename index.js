@@ -7,7 +7,6 @@ const {
   StreamType,
   VoiceConnectionStatus,
   entersState,
-  AudioPlayerStatus,
 } = require('@discordjs/voice');
 const { execSync, spawn } = require('child_process');
 
@@ -23,7 +22,6 @@ const client = new Client({
 const PREFIX = process.env.PREFIX || '!';
 let connection = null;
 let player = createAudioPlayer();
-let queue = [];
 
 // ─── Voice Join ───────────────────────────────────────────────────────────────
 async function joinChannel(guild, channelId) {
@@ -61,58 +59,57 @@ async function joinChannel(guild, channelId) {
   });
 }
 
-// ─── YouTube Streaming via yt-dlp + ffmpeg ────────────────────────────────────
-function playYoutube(url) {
-  return new Promise((resolve, reject) => {
-    let directUrl;
+// ─── Get YouTube URL (tries multiple clients to bypass bot detection) ─────────
+function getYouTubeUrl(youtubeUrl) {
+  // Try clients in order: android (most reliable on datacenter IPs), mweb, web
+  const clients = ['android', 'mweb', 'web'];
+  for (const client of clients) {
     try {
-      // Step 1: get direct audio URL from yt-dlp (no piping issues)
-      directUrl = execSync(
-        `yt-dlp -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-playlist "${url}"`,
-        { timeout: 30000 }
+      const url = execSync(
+        `yt-dlp -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-playlist --no-update ` +
+        `--extractor-args "youtube:player_client=${client}" "${youtubeUrl}"`,
+        { timeout: 30000, stderr: 'pipe' }
       ).toString().trim().split('\n')[0];
-    } catch (err) {
-      return reject(new Error('yt-dlp failed: ' + err.message));
+      if (url && url.startsWith('http')) {
+        console.log(`Got URL via client: ${client}`);
+        return url;
+      }
+    } catch (e) {
+      console.log(`Client ${client} failed, trying next...`);
     }
+  }
+  throw new Error('كل محاولات yt-dlp فشلت — جرب رابط ثاني أو انتظر قليلاً');
+}
 
-    if (!directUrl) return reject(new Error('No URL returned from yt-dlp'));
+// ─── Stream via ffmpeg ────────────────────────────────────────────────────────
+function streamUrl(directUrl) {
+  const ffmpeg = spawn('ffmpeg', [
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    '-i', directUrl,
+    '-analyzeduration', '0',
+    '-loglevel', 'error',
+    '-f', 's16le',
+    '-ar', '48000',
+    '-ac', '2',
+    'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'ignore'] });
 
-    // Step 2: stream through ffmpeg → raw PCM → Discord
-    const ffmpeg = spawn('ffmpeg', [
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5',
-      '-i', directUrl,
-      '-analyzeduration', '0',
-      '-loglevel', 'error',
-      '-f', 's16le',
-      '-ar', '48000',
-      '-ac', '2',
-      'pipe:1',
-    ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-    ffmpeg.on('error', reject);
-
-    const resource = createAudioResource(ffmpeg.stdout, {
-      inputType: StreamType.Raw,
-    });
-
-    resolve(resource);
-  });
+  return createAudioResource(ffmpeg.stdout, { inputType: StreamType.Raw });
 }
 
 // ─── Bot Ready ────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`[BOT ${process.env.BOT_NUMBER || '?'}] ${client.user.tag} ready`);
-
   const guildId   = process.env.GUILD_ID;
   const channelId = process.env.VOICE_CHANNEL_ID;
   if (guildId && channelId) {
     const guild = client.guilds.cache.get(guildId);
     if (guild) await joinChannel(guild, channelId);
-    else console.error(`Guild ${guildId} not found`);
+    else console.error(`Guild ${guildId} not found — is bot invited?`);
   } else {
-    console.log('No GUILD_ID/VOICE_CHANNEL_ID — waiting for !join');
+    console.log('No GUILD_ID/VOICE_CHANNEL_ID — use !join to connect');
   }
 });
 
@@ -124,7 +121,6 @@ client.on('messageCreate', async (message) => {
   const args    = message.content.slice(PREFIX.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
-  // !join
   if (command === 'join') {
     if (!message.member.voice.channel)
       return message.reply('❌ أنت مو في فويس!');
@@ -132,50 +128,47 @@ client.on('messageCreate', async (message) => {
     return message.reply(`✅ انضممت لـ **${message.member.voice.channel.name}**`);
   }
 
-  // !play
   if (command === 'play') {
     const url = args[0];
-    if (!url) return message.reply('❌ أرسل رابط يوتيوب\nمثال: `!play https://youtube.com/watch?v=...`');
-    if (!connection) return message.reply('❌ البوت مو في فويس — استخدم `!join` أول');
+    if (!url)
+      return message.reply('❌ أرسل رابط يوتيوب\nمثال: `!play https://youtu.be/...`');
+    if (!connection)
+      return message.reply('❌ البوت مو في فويس — استخدم `!join` أول');
 
-    const loading = await message.reply('⏳ يحمل الرابط...');
+    const loading = await message.reply('⏳ يحمل...');
     try {
-      const resource = await playYoutube(url);
+      const directUrl = getYouTubeUrl(url);
+      const resource  = streamUrl(directUrl);
       player.play(resource);
-      await loading.edit('🎵 يشغل...');
+      await loading.edit('🎵 يشغل!');
     } catch (err) {
       console.error('Play error:', err.message);
-      await loading.edit(`❌ خطأ: ${err.message}`);
+      await loading.edit(`❌ ${err.message}`);
     }
     return;
   }
 
-  // !stop
   if (command === 'stop') {
     player.stop();
     return message.reply('⏹ وقفت التشغيل');
   }
 
-  // !leave
   if (command === 'leave') {
     if (connection) { connection.destroy(); connection = null; }
     return message.reply('👋 طلعت من الفويس');
   }
 
-  // !ping
   if (command === 'ping') {
     return message.reply(`🏓 Pong! \`${client.ws.ping}ms\``);
   }
 });
 
-// ─── Graceful Shutdown (Railway only) ────────────────────────────────────────
+// ─── Graceful Shutdown ────────────────────────────────────────────────────────
 process.on('SIGTERM', () => {
-  console.log('SIGTERM — shutting down gracefully');
   if (connection) connection.destroy();
   client.destroy();
   process.exit(0);
 });
-
 process.on('SIGINT', () => {
   if (connection) connection.destroy();
   client.destroy();
