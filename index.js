@@ -55,30 +55,30 @@ async function joinChannel(guild, channelId) {
   });
 
   connection.on(VoiceConnectionStatus.Ready, () => {
-    console.log(`[BOT ${process.env.BOT_NUMBER || '?'}] Connected → ${channel.name}`);
+    console.log(`[BOT ${process.env.BOT_NUMBER || '?'}] Connected to voice`);
   });
 }
 
-// ─── Get YouTube URL (tries multiple clients to bypass bot detection) ─────────
+// ─── Get YouTube direct URL (tries android → mweb → web) ─────────────────────
 function getYouTubeUrl(youtubeUrl) {
-  // Try clients in order: android (most reliable on datacenter IPs), mweb, web
   const clients = ['android', 'mweb', 'web'];
-  for (const client of clients) {
+  for (const ytclient of clients) {
     try {
-      const url = execSync(
-        `yt-dlp -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-playlist --no-update ` +
-        `--extractor-args "youtube:player_client=${client}" "${youtubeUrl}"`,
-        { timeout: 30000, stderr: 'pipe' }
-      ).toString().trim().split('\n')[0];
+      const cmd =
+        `python3 -m yt_dlp -f "bestaudio[ext=webm]/bestaudio/best" ` +
+        `--get-url --no-playlist --no-update ` +
+        `--extractor-args "youtube:player_client=${ytclient}" ` +
+        `"${youtubeUrl}"`;
+      const url = execSync(cmd, { timeout: 30000 }).toString().trim().split('\n')[0];
       if (url && url.startsWith('http')) {
-        console.log(`Got URL via client: ${client}`);
+        console.log(`Got URL via client: ${ytclient}`);
         return url;
       }
     } catch (e) {
-      console.log(`Client ${client} failed, trying next...`);
+      console.log(`Client ${ytclient} failed, trying next...`);
     }
   }
-  throw new Error('كل محاولات yt-dlp فشلت — جرب رابط ثاني أو انتظر قليلاً');
+  throw new Error('فشل تحميل الرابط — جرب رابط ثاني');
 }
 
 // ─── Stream via ffmpeg ────────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ client.once('ready', async () => {
   if (guildId && channelId) {
     const guild = client.guilds.cache.get(guildId);
     if (guild) await joinChannel(guild, channelId);
-    else console.error(`Guild ${guildId} not found — is bot invited?`);
+    else console.error(`Guild ${guildId} not found`);
   } else {
     console.log('No GUILD_ID/VOICE_CHANNEL_ID — use !join to connect');
   }
