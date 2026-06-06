@@ -4,10 +4,12 @@ const {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
+  StreamType,
   VoiceConnectionStatus,
   entersState,
+  AudioPlayerStatus,
 } = require('@discordjs/voice');
-const YTDlpWrap = require('yt-dlp-wrap').default;
+const { execSync, spawn } = require('child_process');
 
 const client = new Client({
   intents: [
@@ -20,14 +22,15 @@ const client = new Client({
 
 const PREFIX = process.env.PREFIX || '!';
 let connection = null;
-let player = null;
+let player = createAudioPlayer();
+let queue = [];
 
+// ─── Voice Join ───────────────────────────────────────────────────────────────
 async function joinChannel(guild, channelId) {
   const channel = guild.channels.cache.get(channelId);
-  if (!channel) {
-    console.error(`Channel ${channelId} not found`);
-    return;
-  }
+  if (!channel) { console.error(`Channel ${channelId} not found`); return; }
+
+  if (connection) connection.destroy();
 
   connection = joinVoiceChannel({
     channelId: channel.id,
@@ -37,7 +40,6 @@ async function joinChannel(guild, channelId) {
     selfMute: true,
   });
 
-  player = createAudioPlayer();
   connection.subscribe(player);
 
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -55,103 +57,126 @@ async function joinChannel(guild, channelId) {
   });
 
   connection.on(VoiceConnectionStatus.Ready, () => {
-    console.log(`Connected to voice channel: ${channel.name}`);
+    console.log(`[BOT ${process.env.BOT_NUMBER || '?'}] Connected → ${channel.name}`);
   });
 }
 
+// ─── YouTube Streaming via yt-dlp + ffmpeg ────────────────────────────────────
+function playYoutube(url) {
+  return new Promise((resolve, reject) => {
+    let directUrl;
+    try {
+      // Step 1: get direct audio URL from yt-dlp (no piping issues)
+      directUrl = execSync(
+        `yt-dlp -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-playlist "${url}"`,
+        { timeout: 30000 }
+      ).toString().trim().split('\n')[0];
+    } catch (err) {
+      return reject(new Error('yt-dlp failed: ' + err.message));
+    }
+
+    if (!directUrl) return reject(new Error('No URL returned from yt-dlp'));
+
+    // Step 2: stream through ffmpeg → raw PCM → Discord
+    const ffmpeg = spawn('ffmpeg', [
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
+      '-i', directUrl,
+      '-analyzeduration', '0',
+      '-loglevel', 'error',
+      '-f', 's16le',
+      '-ar', '48000',
+      '-ac', '2',
+      'pipe:1',
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+
+    ffmpeg.on('error', reject);
+
+    const resource = createAudioResource(ffmpeg.stdout, {
+      inputType: StreamType.Raw,
+    });
+
+    resolve(resource);
+  });
+}
+
+// ─── Bot Ready ────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
-  console.log(`[BOT ${process.env.BOT_NUMBER || '?'}] ${client.user.tag} is ready!`);
+  console.log(`[BOT ${process.env.BOT_NUMBER || '?'}] ${client.user.tag} ready`);
 
-  const guildId = process.env.GUILD_ID;
+  const guildId   = process.env.GUILD_ID;
   const channelId = process.env.VOICE_CHANNEL_ID;
-
   if (guildId && channelId) {
     const guild = client.guilds.cache.get(guildId);
-    if (guild) {
-      await joinChannel(guild, channelId);
-    } else {
-      console.error(`Guild ${guildId} not found — make sure bot is invited`);
-    }
+    if (guild) await joinChannel(guild, channelId);
+    else console.error(`Guild ${guildId} not found`);
   } else {
-    console.log('No GUILD_ID/VOICE_CHANNEL_ID set — waiting for !join command');
+    console.log('No GUILD_ID/VOICE_CHANNEL_ID — waiting for !join');
   }
 });
 
+// ─── Commands ─────────────────────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (!message.content.startsWith(PREFIX)) return;
 
-  const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+  const args    = message.content.slice(PREFIX.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
+  // !join
   if (command === 'join') {
-    if (!message.member.voice.channel) {
+    if (!message.member.voice.channel)
       return message.reply('❌ أنت مو في فويس!');
-    }
-    if (connection) connection.destroy();
-
     await joinChannel(message.guild, message.member.voice.channel.id);
-    return message.reply(`✅ انضممت لـ ${message.member.voice.channel.name}`);
+    return message.reply(`✅ انضممت لـ **${message.member.voice.channel.name}**`);
   }
 
+  // !play
   if (command === 'play') {
     const url = args[0];
-    if (!url) return message.reply('❌ أرسل رابط يوتيوب مثل: `!play https://youtube.com/...`');
-    if (!connection) return message.reply('❌ البوت مو في فويس — استخدم !join أول');
+    if (!url) return message.reply('❌ أرسل رابط يوتيوب\nمثال: `!play https://youtube.com/watch?v=...`');
+    if (!connection) return message.reply('❌ البوت مو في فويس — استخدم `!join` أول');
 
+    const loading = await message.reply('⏳ يحمل الرابط...');
     try {
-      await message.reply('⏳ يحمل...');
-      const ytDlp = new YTDlpWrap();
-      const stream = ytDlp.execStream([
-        url,
-        '-f', 'bestaudio[ext=webm]/bestaudio',
-        '-o', '-',
-        '--no-playlist',
-        '--quiet',
-      ]);
-
-      stream.on('error', (err) => {
-        console.error('Stream error:', err.message);
-        message.channel.send('❌ صار خطأ في تحميل الصوت');
-      });
-
-      const resource = createAudioResource(stream);
+      const resource = await playYoutube(url);
       player.play(resource);
-      return message.channel.send('🎵 يشغل...');
+      await loading.edit('🎵 يشغل...');
     } catch (err) {
-      console.error('Play error:', err);
-      return message.reply('❌ صار خطأ في تشغيل الصوت');
+      console.error('Play error:', err.message);
+      await loading.edit(`❌ خطأ: ${err.message}`);
     }
+    return;
   }
 
+  // !stop
   if (command === 'stop') {
-    if (player) player.stop();
+    player.stop();
     return message.reply('⏹ وقفت التشغيل');
   }
 
+  // !leave
   if (command === 'leave') {
-    if (connection) {
-      connection.destroy();
-      connection = null;
-    }
+    if (connection) { connection.destroy(); connection = null; }
     return message.reply('👋 طلعت من الفويس');
   }
 
+  // !ping
   if (command === 'ping') {
-    return message.reply(`🏓 Pong! ${client.ws.ping}ms`);
+    return message.reply(`🏓 Pong! \`${client.ws.ping}ms\``);
   }
 });
 
-// Graceful shutdown — only when Railway/process stops it
+// ─── Graceful Shutdown (Railway only) ────────────────────────────────────────
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received — shutting down gracefully');
+  console.log('SIGTERM — shutting down gracefully');
   if (connection) connection.destroy();
   client.destroy();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('SIGINT received — shutting down');
   if (connection) connection.destroy();
   client.destroy();
   process.exit(0);
